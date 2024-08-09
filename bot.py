@@ -15,7 +15,7 @@ from telegram.helpers import escape_markdown
 import pyzipper
 import requests
 from requests.exceptions import RequestException
-
+from aiolimiter import AsyncLimiter
 
 # --- DISCLAIMER ---
 # This script is for academic and research purposes only.
@@ -73,6 +73,9 @@ file_history = {}
 file_counter = 0
 file_size_cache = {}
 
+# Rate limiter to respect Telegram API limits
+rate_limiter = AsyncLimiter(20, 1)  # 20 calls per second
+
 # --- Utility Functions ---
 
 def load_data(file_path):
@@ -110,33 +113,34 @@ def calculate_md5(file_path):
 
 async def send_file(file_path, caption, part_number=None, total_parts=None):
     """Sends a file to Telegram with error handling."""
-    try:
-        escaped_caption = escape_markdown(caption, version=2)  # Escape special characters
-        if part_number is not None and total_parts is not None:
-            escaped_caption += f"\n\\(Part {part_number}/{total_parts}\\)"  # Double escape parentheses
-        with open(file_path, 'rb') as file:
-            message = await bot.send_document(chat_id=CHAT_ID, document=file,
-                                              caption=escaped_caption, parse_mode=ParseMode.MARKDOWN_V2)
-        logger.info(f"File sent successfully: {file_path}")
+    async with rate_limiter:
+        try:
+            escaped_caption = escape_markdown(caption, version=2)  # Escape special characters
+            if part_number is not None and total_parts is not None:
+                escaped_caption += f"\n\\(Part {part_number}/{total_parts}\\)"  # Double escape parentheses
+            with open(file_path, 'rb') as file:
+                message = await bot.send_document(chat_id=CHAT_ID, document=file,
+                                                  caption=escaped_caption, parse_mode=ParseMode.MARKDOWN_V2)
+            logger.info(f"File sent successfully: {file_path}")
 
-        if ENABLE_FORWARD:
-            try:
-                bot_user = await bot.get_me()
-                chat_member = await bot.get_chat_member(chat_id=FORWARD_CHAT_ID, user_id=bot_user.id)
-                if chat_member.status == "kicked":
-                    logger.error(f"Bot kicked from chat: {FORWARD_CHAT_ID}")
-                else:
-                    await bot.forward_message(chat_id=FORWARD_CHAT_ID, from_chat_id=CHAT_ID,
-                                          message_id=message.message_id)
-                    logger.info(f"Message forwarded to {FORWARD_CHAT_ID}")
-            except TelegramError as e:
-                logger.error(f"Error forwarding message to {FORWARD_CHAT_ID}: {str(e)}")
+            if ENABLE_FORWARD:
+                try:
+                    bot_user = await bot.get_me()
+                    chat_member = await bot.get_chat_member(chat_id=FORWARD_CHAT_ID, user_id=bot_user.id)
+                    if chat_member.status == "kicked":
+                        logger.error(f"Bot kicked from chat: {FORWARD_CHAT_ID}")
+                    else:
+                        await bot.forward_message(chat_id=FORWARD_CHAT_ID, from_chat_id=CHAT_ID,
+                                                  message_id=message.message_id)
+                        logger.info(f"Message forwarded to {FORWARD_CHAT_ID}")
+                except TelegramError as e:
+                    logger.error(f"Error forwarding message to {FORWARD_CHAT_ID}: {str(e)}")
 
-        return True
-    except TelegramError as e:
-        logger.error(f"Error sending file {file_path}: {str(e)}")
-        await bot.send_message(chat_id=CHAT_ID, text=f"Error sending file: {file_path}. Check logs.")
-        return False
+            return True
+        except TelegramError as e:
+            logger.error(f"Error sending file {file_path}: {str(e)}")
+            await bot.send_message(chat_id=CHAT_ID, text=f"Error sending file: {file_path}. Check logs.")
+            return False
 
 
 async def split_and_send_zip(file_path, skip_zip=False):
