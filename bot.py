@@ -8,7 +8,7 @@ import json
 import configparser
 import zipfile
 from datetime import datetime, timedelta
-from telegram import Bot, InputFile
+from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.helpers import escape_markdown
@@ -39,13 +39,14 @@ CHECK_INTERVAL = int(config['General']['check_interval'])
 MAX_FILE_SIZE = 45 * 1024 * 1024  # 45 MB
 LOG_RETENTION_DAYS = int(config['General']['log_retention_days'])
 FILE_HISTORY_PATH = 'data/bot_file_history.json'
-FILE_SIZE_CACHE_PATH = 'data/file_size_cache.json'
+FILE_SIZE_CACHE_PATH = 'data/file_size_cache.json'  # Path for the file size cache
 ENABLE_ENCRYPTION = config['General'].getboolean('enable_encryption', False)
 ZIP_PASSWORD = config['General'].get('zip_password', '')
-ALLOWED_EXTENSIONS = set(config['General'].get('allowed_extensions', '').split(',')) if config['General'].get('allowed_extensions') else set()
-ENABLE_CACHE = config['General'].getboolean('enable_cache', True)
-COMPRESSION_LEVEL = config['General'].get('compression_level', 'default').lower()
-DISABLE_LOGS = config['General'].getboolean('disable_logs', False)
+ALLOWED_EXTENSIONS = set(
+    config['General'].get('allowed_extensions', '').split(',')) if config['General'].get('allowed_extensions') else set()
+ENABLE_CACHE = config['General'].getboolean('enable_cache', True)  # Cache enabled by default
+COMPRESSION_LEVEL = config['General'].get('compression_level', 'default').lower()  # default, fast, none
+DISABLE_LOGS = config['General'].getboolean('disable_logs', False)  # Logging enabled by default
 
 # --- Configuration Validation ---
 if ENABLE_ENCRYPTION and COMPRESSION_LEVEL == 'none':
@@ -58,23 +59,22 @@ log_handler = logging.FileHandler('logs/bot_log.txt')
 log_handler.setFormatter(log_formatter)
 logger = logging.getLogger()
 
+# Set initial logging level based on config
 if DISABLE_LOGS:
-    logger.setLevel(logging.CRITICAL)
-    logger.removeHandler(log_handler)
+    logger.setLevel(logging.CRITICAL) 
 else:
     logger.setLevel(logging.DEBUG)
-    logger.addHandler(log_handler)
+
+logger.addHandler(log_handler)
 
 # --- Global Variables ---
 bot = Bot(token=TOKEN)
 file_history = {}
 file_counter = 0
 file_size_cache = {}
-error_messages = {}  # Store error message IDs
 
-# Rate limiters to respect Telegram API limits
-message_limiter = AsyncLimiter(30, 1)  # 30 messages per second
-media_limiter = AsyncLimiter(20, 60)  # 20 media uploads per minute
+# Rate limiter to respect Telegram API limits
+rate_limiter = AsyncLimiter(20, 1)  # 20 calls per second
 
 # --- Utility Functions ---
 
@@ -91,6 +91,7 @@ def load_data(file_path):
         logger.error(f"Error decoding JSON from {file_path}. Creating a new file.")
         return {}
 
+
 def save_data(data, file_path):
     """Saves JSON data to a file."""
     try:
@@ -100,78 +101,76 @@ def save_data(data, file_path):
     except Exception as e:
         logger.error(f"Error saving data to {file_path}: {str(e)}")
 
+
 def calculate_md5(file_path):
     """Calculates the MD5 hash of a file."""
     hash_md5 = hashlib.md5()
     with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        while chunk := f.read(8192):  # Read in larger chunks
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-async def send_file(file_path, caption, part_number=None, total_parts=None):
-    """Sends a file to Telegram, handling rate limits and potential errors."""
-    async with media_limiter:
-        try:
-            escaped_caption = escape_markdown(caption, version=2)
-            if part_number is not None and total_parts is not None:
-                escaped_caption += f"\n\\(Part {part_number}/{total_parts}\\)"
 
+async def send_file(file_path, caption, part_number=None, total_parts=None):
+    """Sends a file to Telegram with error handling."""
+    async with rate_limiter:
+        try:
+            escaped_caption = escape_markdown(caption, version=2)  # Escape special characters
+            if part_number is not None and total_parts is not None:
+                escaped_caption += f"\n\\(Part {part_number}/{total_parts}\\)"  # Double escape parentheses
             with open(file_path, 'rb') as file:
-                message = await bot.send_document(chat_id=CHAT_ID, 
-                                                  document=InputFile(file),
-                                                  caption=escaped_caption, 
-                                                  parse_mode=ParseMode.MARKDOWN_V2)
+                message = await bot.send_document(chat_id=CHAT_ID, document=file,
+                                                  caption=escaped_caption, parse_mode=ParseMode.MARKDOWN_V2)
             logger.info(f"File sent successfully: {file_path}")
 
             if ENABLE_FORWARD:
-                await forward_message(message)
-
-            if file_path in error_messages:
-                await bot.delete_message(chat_id=CHAT_ID, message_id=error_messages[file_path])
-                del error_messages[file_path]
+                try:
+                    bot_user = await bot.get_me()
+                    chat_member = await bot.get_chat_member(chat_id=FORWARD_CHAT_ID, user_id=bot_user.id)
+                    if chat_member.status == "kicked":
+                        logger.error(f"Bot kicked from chat: {FORWARD_CHAT_ID}")
+                    else:
+                        await bot.forward_message(chat_id=FORWARD_CHAT_ID, from_chat_id=CHAT_ID,
+                                                  message_id=message.message_id)
+                        logger.info(f"Message forwarded to {FORWARD_CHAT_ID}")
+                except TelegramError as e:
+                    logger.error(f"Error forwarding message to {FORWARD_CHAT_ID}: {str(e)}")
 
             return True
         except TelegramError as e:
-            if hasattr(e, 'response') and e.response.status_code == 429:
-                retry_after = int(e.response.headers.get('Retry-After', 1))
-                logger.warning(f"Flood control exceeded. Retrying in {retry_after} seconds.")
-                await asyncio.sleep(retry_after)
-                return await send_file(file_path, caption, part_number, total_parts)
-            else:
-                logger.error(f"Error sending file {file_path}: {str(e)}")
-                error_message = await bot.send_message(chat_id=CHAT_ID, 
-                                                       text=f"Error sending file: {file_path}. Check logs.")
-                error_messages[file_path] = error_message.message_id
-                return False
-
-async def forward_message(message):
-    """Forwards a message to the specified chat if enabled."""
-    try:
-        bot_user = await bot.get_me()
-        chat_member = await bot.get_chat_member(chat_id=FORWARD_CHAT_ID, user_id=bot_user.id)
-        if chat_member.status == "kicked":
-            logger.error(f"Bot kicked from chat: {FORWARD_CHAT_ID}")
-        else:
-            await bot.forward_message(chat_id=FORWARD_CHAT_ID, from_chat_id=CHAT_ID,
-                                      message_id=message.message_id)
-            logger.info(f"Message forwarded to {FORWARD_CHAT_ID}")
-    except TelegramError as e:
-        logger.error(f"Error forwarding message to {FORWARD_CHAT_ID}: {str(e)}")
+            logger.error(f"Error sending file {file_path}: {str(e)}")
+            await bot.send_message(chat_id=CHAT_ID, text=f"Error sending file: {file_path}. Check logs.")
+            return False
 
 
 async def split_and_send_zip(file_path, skip_zip=False):
-    """Splits a large file into chunks and sends them as a zipped archive."""
+    """Splits a large file, compresses (optional), and sends parts to Telegram."""
     global file_counter
     try:
         base_name = os.path.basename(file_path)
-        original_size = os.path.getsize(file_path)
         with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = await create_zip_archive(file_path, base_name, temp_dir, skip_zip)
+            # --- Zip only if not skipped and not already a zip file ---
+            if not skip_zip and COMPRESSION_LEVEL != 'none' and not file_path.lower().endswith('.zip'):
+                zip_path = os.path.join(temp_dir, f'{base_name}.zip')
+                logger.info(f"Compressing file: {file_path}")
+                compression = zipfile.ZIP_DEFLATED if COMPRESSION_LEVEL == 'default' else zipfile.ZIP_STORED
+                if ENABLE_ENCRYPTION:
+                    with pyzipper.AESZipFile(zip_path, 'w', compression=compression,
+                                             encryption=pyzipper.WZ_AES) as zipf:
+                        zipf.setpassword(ZIP_PASSWORD.encode())
+                        zipf.write(file_path, base_name)
+                else:
+                    with zipfile.ZipFile(zip_path, 'w', compression) as zipf:
+                        zipf.write(file_path, base_name)
+            else:
+                zip_path = file_path  # Use the original file path if not zipping
 
+            # --- Splitting logic ---
             logger.info(f"Splitting file: {zip_path}")
             chunk_size = MAX_FILE_SIZE
             file_number = 1
-            total_parts = os.path.getsize(zip_path) // chunk_size + (1 if os.path.getsize(zip_path) % chunk_size else 0)
+            total_parts = os.path.getsize(zip_path) // chunk_size + (
+                1 if os.path.getsize(zip_path) % chunk_size else 0)
 
             with open(zip_path, 'rb') as zip_file:
                 while True:
@@ -179,54 +178,24 @@ async def split_and_send_zip(file_path, skip_zip=False):
                     if not chunk:
                         break
 
-                    chunk_name = os.path.join(temp_dir, f'{base_name}.{file_number:03d}')
+                    # --- Corrected chunk_name generation ---
+                    chunk_name = os.path.join(temp_dir, f'{base_name}.{file_number:03d}')  # Remove extra ".zip"
+
                     with open(chunk_name, 'wb') as chunk_file:
                         chunk_file.write(chunk)
 
                     logger.info(f"Sending part {file_number}/{total_parts}: {chunk_name}")
                     caption = f"Part {file_number} of {base_name}"
-                    success = await send_file(chunk_name, caption, part_number=file_number, total_parts=total_parts)
+                    success = await send_file(chunk_name, caption)
                     if not success:
                         logger.error(f"Failed to send part {file_number} of {base_name}")
-                        return False, 0
+                        return False
 
                     file_number += 1
                     file_counter += 1
 
-            await send_reassembly_instructions(base_name, file_number)
-
-            if not skip_zip and COMPRESSION_LEVEL != 'none' and not file_path.lower().endswith('.zip'):
-                os.remove(zip_path)
-                logger.debug(f"Deleted temporary zipped file: {zip_path}")
-
-            return True, original_size
-    except Exception as e:
-        logger.error(f"Error splitting and sending file {file_path}: {str(e)}")
-        await send_error_message(base_name)
-        return False, 0
-
-async def create_zip_archive(file_path, base_name, temp_dir, skip_zip):
-    """Creates a zip archive of the file, either compressing it or using the original if it's already a zip."""
-    if not skip_zip and COMPRESSION_LEVEL != 'none' and not file_path.lower().endswith('.zip'):
-        zip_path = os.path.join(temp_dir, f'{base_name}.zip')
-        logger.info(f"Compressing file: {file_path}")
-        compression = zipfile.ZIP_DEFLATED if COMPRESSION_LEVEL == 'default' else zipfile.ZIP_STORED
-        if ENABLE_ENCRYPTION:
-            with pyzipper.AESZipFile(zip_path, 'w', compression=compression,
-                                     encryption=pyzipper.WZ_AES) as zipf:
-                zipf.setpassword(ZIP_PASSWORD.encode())
-                zipf.write(file_path, base_name)
-        else:
-            with zipfile.ZipFile(zip_path, 'w', compression) as zipf:
-                zipf.write(file_path, base_name)
-        return zip_path
-    else:
-        return file_path
-
-async def send_reassembly_instructions(base_name, file_number):
-    """Sends instructions to the user on how to reassemble the split files."""
-    encryption_note = "The ZIP file is encrypted. You'll need the password to extract it." if ENABLE_ENCRYPTION else "The ZIP file is not encrypted."
-    instructions = f"""```
+            encryption_note = "The ZIP file is encrypted. You'll need the password to extract it." if ENABLE_ENCRYPTION else "The ZIP file is not encrypted."
+            instructions = f"""```
 To reassemble the file:
 1. Download all parts ({file_number - 1} in total)
 2. Use one of the following commands:
@@ -239,20 +208,25 @@ To reassemble the file:
 
 {encryption_note}
 ```"""
-    async with message_limiter:  # Apply rate limit to message sending
-        await bot.send_message(chat_id=CHAT_ID, text=instructions, parse_mode=ParseMode.MARKDOWN)
-    if FORWARD_CHAT_ID and ENABLE_FORWARD:
-        async with message_limiter:
-            await bot.send_message(chat_id=FORWARD_CHAT_ID, text=instructions, parse_mode=ParseMode.MARKDOWN)
+            await bot.send_message(chat_id=CHAT_ID, text=instructions, parse_mode=ParseMode.MARKDOWN)
+            if FORWARD_CHAT_ID and ENABLE_FORWARD:
+                await bot.send_message(chat_id=FORWARD_CHAT_ID, text=instructions, parse_mode=ParseMode.MARKDOWN)
 
-async def send_error_message(base_name):
-    """Sends a generic error message to the user."""
-    async with message_limiter:
+        # --- Delete the zipped file if it was created ---
+        if not skip_zip and COMPRESSION_LEVEL != 'none' and not file_path.lower().endswith('.zip'):
+            os.remove(zip_path)
+            logger.debug(f"Deleted temporary zipped file: {zip_path}")
+
+        return True
+    except Exception as e:
+        logger.error(f"Error splitting and sending file {file_path}: {str(e)}")
         await bot.send_message(chat_id=CHAT_ID, text=f"Error processing file: {base_name}. Check logs.")
+        return False
+
 
 async def send_event_to_backend(event_type, file_name, file_id, file_hash, file_size, processing_time,
                                upload_speed):
-    """Sends an event to the backend server, logging any errors."""
+    """Sends an event to the backend server."""
     try:
         backend_url = 'http://localhost:5000/event'
         data = {
@@ -270,15 +244,19 @@ async def send_event_to_backend(event_type, file_name, file_id, file_hash, file_
     except RequestException as e:
         logger.warning(f"Unable to connect to backend: {str(e)}")
 
+
 async def process_file(file_path):
-    """Processes a file, compressing, splitting, and sending it to Telegram."""
+    """Processes a file, handling hashing, upload, and event sending."""
     global file_counter
     start_time = time.time()
     file_hash = calculate_md5(file_path)
-    original_size = os.path.getsize(file_path)
+    file_size = os.path.getsize(file_path)
     base_name = os.path.basename(file_path)
     upload_start_time = time.time()
 
+    success = False
+
+    # Check if file hash already exists in the history
     if any(file_data['hash'] == file_hash for file_data in file_history.values()):
         logger.info(f"File with the same hash already exists: {file_path}")
         return
@@ -287,11 +265,13 @@ async def process_file(file_path):
         logger.info(f"File ignored (extension not allowed): {file_path}")
         return
 
+    # --- Create temporary directory outside the if block ---
     with tempfile.TemporaryDirectory() as temp_dir:
+        # --- ALWAYS zip the file, unless compression is set to 'none' or already zipped ---
         if COMPRESSION_LEVEL == 'none' or (file_path.lower().endswith('.zip') and not ENABLE_ENCRYPTION):
-            send_path = file_path
+            send_path = file_path  # Send original file
         else:
-            send_path = os.path.join(temp_dir, f'{base_name}.zip')
+            send_path = os.path.join(temp_dir, f'{base_name}.zip')  # Create path for zip file
             logger.info(f"Compressing file: {file_path} into {send_path}")
             compression = zipfile.ZIP_DEFLATED if COMPRESSION_LEVEL == 'default' else zipfile.ZIP_STORED
             if ENABLE_ENCRYPTION:
@@ -302,62 +282,62 @@ async def process_file(file_path):
                 with zipfile.ZipFile(send_path, 'w', compression) as zipf:
                     zipf.write(file_path, base_name)
 
+        # --- Upload Logic --- #
         if file_path not in file_history or file_history[file_path]['hash'] != file_hash:
             logger.info(f"New file detected or file modified: {file_path}")
 
             if os.path.getsize(send_path) > MAX_FILE_SIZE:
                 logger.info(f"File size exceeds {MAX_FILE_SIZE} bytes. Splitting and sending: {send_path}")
-                if send_path.lower().endswith('.zip'):
-                    success, file_size = await split_and_send_zip(send_path, skip_zip=True)
+                if send_path.lower().endswith('.zip'):  # Check if already zipped
+                    success = await split_and_send_zip(send_path,
+                                                      skip_zip=True)  # Skip zipping if already zipped
                 else:
-                    success, file_size = await split_and_send_zip(send_path)
+                    success = await split_and_send_zip(send_path)
             else:
                 logger.info(f"Sending file: {send_path}")
                 encryption_status = "🔒 Encrypted" if ENABLE_ENCRYPTION else "🔓 Not encrypted"
                 caption = f"File: {base_name}\n{encryption_status}"
-                success = await send_file(send_path, caption)
-                file_size = os.path.getsize(send_path)
+                success = await send_file(send_path, caption)  # Send the zipped file
 
-            if success:
-                file_counter += 1
-                encryption_algorithm = "AES" if ENABLE_ENCRYPTION else "None"
-                processing_time = (time.time() - start_time) * 1000
-                upload_speed = file_size / (time.time() - upload_start_time) if (
-                            time.time() - upload_start_time) != 0 else 0
-                file_history[file_path] = {
-                    'hash': file_hash,
-                    'last_sent': datetime.now().isoformat(),
-                    'send_success': True,
-                    'encrypted': ENABLE_ENCRYPTION,
-                    'encryption_algorithm': encryption_algorithm,
-                    'file_id': file_counter,
-                    'file_size': original_size,
-                    'processed_size': file_size,
-                    'processing_time': processing_time,
-                    'upload_speed': upload_speed
-                }
-                save_data(file_history, FILE_HISTORY_PATH)
-                await send_event_to_backend('success', base_name, file_counter, file_hash, original_size,
-                                           processing_time, upload_speed)
-            else:
-                logger.error(f"Failed to send file: {file_path}")
-                await send_event_to_backend('failure', base_name, file_counter, file_hash, original_size, 0, 0)
+        if success:
+            file_counter += 1
+            encryption_algorithm = "AES" if ENABLE_ENCRYPTION else "None"
+            file_history[file_path] = {
+                'hash': file_hash,
+                'last_sent': datetime.now().isoformat(),
+                'send_success': True,
+                'encrypted': ENABLE_ENCRYPTION,
+                'encryption_algorithm': encryption_algorithm,
+                'file_id': file_counter,
+                'file_size': file_size,
+                'processing_time': (time.time() - start_time) * 1000,
+                'upload_speed': file_size / (time.time() - upload_start_time) if (
+                        time.time() - upload_start_time) != 0 else 0  # Fixed: Prevent division by zero
+            }
+            save_data(file_history, FILE_HISTORY_PATH)
+            await send_event_to_backend('success', base_name, file_counter, file_hash, file_size,
+                                       (time.time() - start_time) * 1000,
+                                       file_history[file_path]['upload_speed'])
+        else:
+            logger.debug(f"File already sent and not modified: {file_path}")
+
 
 def clean_old_logs():
-    """Deletes old log files based on the configured retention period."""
+    """Deletes old log files for privacy."""
     current_time = datetime.now()
     deletion_time = current_time - timedelta(days=LOG_RETENTION_DAYS)
 
-    for filename in os.listdir('logs'):
-        if filename.endswith('.txt') and filename.startswith('bot_log'):
-            file_path = os.path.join('logs', filename)
-            file_time = datetime.fromtimestamp(os.path.getctime(file_path))
-            if file_time < deletion_time:
-                os.remove(file_path)
-                logger.info(f"Log file deleted for privacy: {filename}")
+    log_files = [f for f in os.listdir('logs') if f.endswith('.txt') and f.startswith('bot_log')]
+    for log_file in log_files:
+        file_path = os.path.join('logs', log_file)
+        file_time = datetime.fromtimestamp(os.path.getctime(file_path))
+        if file_time < deletion_time:
+            os.remove(file_path)
+            logger.info(f"Log file deleted for privacy: {log_file}")
+
 
 def build_file_size_cache():
-    """Creates a cache of file sizes for faster processing."""
+    """Builds a cache of file sizes for upload prioritization."""
     global file_size_cache
     for folder in FOLDERS_TO_MONITOR:
         for root, _, files in os.walk(folder):
@@ -367,16 +347,19 @@ def build_file_size_cache():
     save_data(file_size_cache, FILE_SIZE_CACHE_PATH)
     logger.info("File size cache built.")
 
+
 async def main():
     global file_history, file_counter, file_size_cache
     logger.info("Bot started.")
     print("Bot started. Press Ctrl+C to interrupt.")
 
+    # Load data
     file_history = load_data(FILE_HISTORY_PATH)
     file_counter = max(file_history.values(), key=lambda x: x.get('file_id', 0), default={}).get('file_id', 0)
-    if ENABLE_CACHE:
+    if ENABLE_CACHE:  # Load cache only if enabled
         file_size_cache = load_data(FILE_SIZE_CACHE_PATH)
 
+    # Attempt to send file history to backend
     try:
         backend_url = 'http://localhost:5000/file_history'
         response = requests.post(backend_url, json=file_history, timeout=5)
@@ -391,17 +374,16 @@ async def main():
             clean_old_logs()
 
             if ENABLE_CACHE:
-                build_file_size_cache()
-                # Sort by size, smallest first
-                sorted_files = sorted(file_size_cache, key=file_size_cache.get)  
+                build_file_size_cache()  # Rebuild cache if enabled
+                sorted_files = sorted(file_size_cache, key=file_size_cache.get)
             else:
+                # Get all files from the monitored folders without caching
                 sorted_files = []
                 for folder in FOLDERS_TO_MONITOR:
                     for root, _, files in os.walk(folder):
                         for file in files:
                             file_path = os.path.join(root, file)
                             sorted_files.append(file_path)
-                sorted_files.sort(key=os.path.getsize) # Sort by size, smallest first
 
             for file_path in sorted_files:
                 await process_file(file_path)
@@ -414,6 +396,7 @@ async def main():
         except Exception as e:
             logger.error(f"General error: {str(e)}")
             await asyncio.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
